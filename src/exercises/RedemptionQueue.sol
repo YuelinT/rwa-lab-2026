@@ -94,8 +94,11 @@ contract RedemptionQueue is AccessControl {
     /// @notice Value `shares` (18 decimals) in USDC smallest units (6 decimals), at an
     ///         8-decimal NAV
     /// @dev The product carries 18 + 8 = 26 decimals and you want 6 — divide by 10 to the what?
+
     function assetsAtNav(uint256 shares, uint256 nav) public pure returns (uint256) {
-        revert("TODO Ex5.1: assetsAtNav");
+        // Shares use 18 decimals and NAV uses 8, while USDC uses 6.
+        // Dividing by 10^20 converts the 26-decimal product into USDC units.
+        return shares * nav / DECIMALS_SCALE;
     }
 
     // ==================================================================
@@ -112,7 +115,25 @@ contract RedemptionQueue is AccessControl {
     ///      Locking the rate now is the point: the payout must not drift with the NAV while
     ///      the ticket waits in the queue.
     function enqueue(uint256 shares) external returns (uint256 id) {
-        revert("TODO Ex5.2: enqueue");
+        if (shares == 0) revert ZeroAmount();
+
+        // Escrow first so every recorded ticket is backed by shares
+        // that the queue actually controls.
+        IERC20(address(tBill)).safeTransferFrom(msg.sender, address(this), shares);
+
+        // Lock the current NAV here so the promised payout cannot
+        // change while the off-chain T+1 settlement is pending.
+        uint256 assetsLocked = assetsAtNav(shares, vault.navPerShare());
+
+        id = requests.length;
+        requests.push(
+            Request({owner: msg.sender, shares: shares, assetsLocked: assetsLocked, settled: false})
+        );
+
+        pendingShares += shares;
+        pendingAssets += assetsLocked;
+
+        emit RedeemRequested(id, msg.sender, shares, assetsLocked);
     }
 
     // ==================================================================
@@ -131,8 +152,43 @@ contract RedemptionQueue is AccessControl {
     ///        - decrement pendingShares and pendingAssets
     ///        - credit the owner's claimable balance and totalClaimable
     ///      Return how much you actually paid out.
+
     function settle(uint256 assets) external onlyRole(SETTLER_ROLE) returns (uint256 filled) {
-        revert("TODO Ex5.3: settle");
+        uint256 remaining = assets;
+
+        while (head < requests.length) {
+            Request storage request = requests[head];
+
+            // A ticket is indivisible. If the oldest request cannot be
+            // paid in full, stop so no later holder can jump the queue.
+            if (request.assetsLocked > remaining) break;
+
+            uint256 requestId = head;
+            uint256 payout = request.assetsLocked;
+            uint256 sharesToBurn = request.shares;
+            address owner = request.owner;
+
+            // Settlement cash comes from the vault only after the
+            // off-chain T-Bills have been sold and proceeds returned.
+            vault.releaseReserves(address(this), payout);
+
+            request.settled = true;
+            head = requestId + 1;
+
+            // Burning closes the redeemed claim after its cash has
+            // become fully reserved in the queue.
+            tBill.burn(address(this), sharesToBurn);
+
+            pendingShares -= sharesToBurn;
+            pendingAssets -= payout;
+            claimable[owner] += payout;
+            totalClaimable += payout;
+
+            filled += payout;
+            remaining -= payout;
+
+            emit Settled(requestId, owner, payout);
+        }
     }
 
     // ==================================================================
@@ -142,6 +198,16 @@ contract RedemptionQueue is AccessControl {
     /// @notice Withdraw the cash credited to you by settled tickets
     /// @dev Checks-effects-interactions: zero the balance before the transfer.
     function claim() external returns (uint256 assets) {
-        revert("TODO Ex5.4: claim");
+        assets = claimable[msg.sender];
+        if (assets == 0) revert NothingToClaim();
+
+        // Apply checks-effects-interactions: remove the accounting claim
+        // before transferring USDC, preventing the same claim being reused.
+        claimable[msg.sender] = 0;
+        totalClaimable -= assets;
+
+        usdc.safeTransfer(msg.sender, assets);
+
+        emit Claimed(msg.sender, assets);
     }
 }

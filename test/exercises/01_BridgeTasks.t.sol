@@ -72,7 +72,11 @@ contract BridgeTasksTest is Test {
     ///      custodian.realHoldings(). One of them is 1000e18; the other is zero. Assert both,
     ///      then ask yourself which contract ever talked to the custodian.
     function test_Ex2_SharesExistWhileTheCustodianHoldsNothing() public {
-        assertTrue(false, "TODO Ex2.1");
+        _subscribe(alice, 1_000e6);
+        // Subscription mints an on-chain claim without checking whether
+        // the off-chain custodian has actually purchased any T-Bills.
+        assertEq(tBill.balanceOf(alice), 1_000e18);
+        assertEq(custodian.realHoldings(), 0);
     }
 
     /// @dev The custodian's `treasury` is a number a permissioned address can move. Prove that
@@ -80,11 +84,18 @@ contract BridgeTasksTest is Test {
     ///      Hint: recordPurchase is onlyRole(CUSTODIAN_ROLE) and `admin` holds it. Call
     ///      custodian.recordPurchase(1_000_000e6), then assert realHoldings() jumped while
     ///      usdc.balanceOf(address(custodian)) is still zero.
+
     function test_Ex2_RealHoldingsIsJustANumber() public {
-        assertTrue(false, "TODO Ex2.2");
+        // The authorised custodian can update the reported backing directly;
+        // no reserve asset needs to move for this number to change.
+        custodian.recordPurchase(1_000_000e6);
+
+        assertEq(custodian.realHoldings(), 1_000_000e6);
+        assertEq(usdc.balanceOf(address(custodian)), 0);
     }
 
     // ==================================================================
+
     // Ex3 · plank (b) attestation — the chain's only window is one number
     // ==================================================================
 
@@ -95,7 +106,19 @@ contract BridgeTasksTest is Test {
     ///      vault.totalClaimValue(); then vault.attest(int256(NAV_1_25)); read both again.
     ///      Shares stay 1000e18; the claim goes 1000e6 -> 1250e6.
     function test_Ex3_TheClaimFloats_TheShareCountDoesNot() public {
-        assertTrue(false, "TODO Ex3.1");
+        _subscribe(alice, 1_000e6);
+
+        uint256 sharesBefore = tBill.balanceOf(alice);
+        uint256 claimBefore = vault.totalClaimValue();
+
+        // An attestation changes the reported value of every share,
+        // but it must not mint or burn any shares.
+        vault.attest(int256(NAV_1_25));
+
+        assertEq(sharesBefore, 1_000e18);
+        assertEq(tBill.balanceOf(alice), sharesBefore);
+        assertEq(claimBefore, 1_000e6);
+        assertEq(vault.totalClaimValue(), 1_250e6);
     }
 
     /// @dev One number re-prices the entire book. Two holders, one call, and both claim values
@@ -105,7 +128,23 @@ contract BridgeTasksTest is Test {
     ///      vault.assetsForShares(tBill.balanceOf(who)). Pick a moderate NAV (e.g. 50e8) so the
     ///      totals stay small and readable.
     function test_Ex3_OneCallMovesTheWholeBook() public {
-        assertTrue(false, "TODO Ex3.2");
+        _subscribe(alice, 1_000e6);
+        _subscribe(bob, 500e6);
+
+        uint256 aliceShares = tBill.balanceOf(alice);
+        uint256 bobShares = tBill.balanceOf(bob);
+
+        assertEq(vault.assetsForShares(aliceShares), 1_000e6);
+        assertEq(vault.assetsForShares(bobShares), 500e6);
+
+        // Both holders depend on the same trusted NAV, so one reporter
+        // update re-prices the entire book without touching their balances.
+        vault.attest(int256(NAV_1_25));
+
+        assertEq(vault.assetsForShares(aliceShares), 1_250e6);
+        assertEq(vault.assetsForShares(bobShares), 625e6);
+        assertEq(tBill.balanceOf(alice), aliceShares);
+        assertEq(tBill.balanceOf(bob), bobShares);
     }
 
     // ==================================================================
@@ -118,7 +157,21 @@ contract BridgeTasksTest is Test {
     ///      TBillToken.NotWhitelisted(attacker). A vague "it reverted" stays green even after
     ///      the guard is removed, so assert the exact selector.
     function test_Ex4_NoKyc_NoShares_EvenIfYouPay() public {
-        assertTrue(false, "TODO Ex4.1");
+        uint256 assets = 1_000e6;
+
+        // Fund and approve first so the failure specifically proves that
+        // admission control—not a missing balance or allowance—blocks entry.
+        usdc.faucet(attacker, assets);
+        vm.startPrank(attacker);
+        usdc.approve(address(vault), assets);
+
+        vm.expectRevert(abi.encodeWithSelector(TBillToken.NotWhitelisted.selector, attacker));
+        vault.subscribe(assets);
+        vm.stopPrank();
+
+        // The reverted subscription is atomic: no cash or shares are lost.
+        assertEq(usdc.balanceOf(attacker), assets);
+        assertEq(tBill.balanceOf(attacker), 0);
     }
 
     /// @dev A whitelisted holder still cannot SEND shares to a non-whitelisted address —
@@ -126,7 +179,18 @@ contract BridgeTasksTest is Test {
     ///      Hint: alice subscribes, then alice calls tBill.transfer(attacker, 1e18). Pin the
     ///      revert on NotWhitelisted(attacker) — note WHICH address appears in the error.
     function test_Ex4_TransferChecksBothEndpoints() public {
-        assertTrue(false, "TODO Ex4.2");
+        _subscribe(alice, 1_000e6);
+
+        // Checking only the sender would let a compliant holder transfer
+        // regulated shares to an address that has never passed KYC.
+        vm.startPrank(alice);
+        vm.expectRevert(abi.encodeWithSelector(TBillToken.NotWhitelisted.selector, attacker));
+        tBill.transfer(attacker, 1e18);
+        vm.stopPrank();
+
+        // A rejected transfer must leave both balances unchanged.
+        assertEq(tBill.balanceOf(alice), 1_000e18);
+        assertEq(tBill.balanceOf(attacker), 0);
     }
 
     /// @dev Removing an address from the list freezes that individual holder — and it is
@@ -137,6 +201,20 @@ contract BridgeTasksTest is Test {
     ///      reverts NotWhitelisted(alice). Do not reach for pause() — that is a global switch,
     ///      a different question (STUDENT-QUESTIONS.md C2).
     function test_Ex4_FreezeBeatsConfiscation() public {
-        assertTrue(false, "TODO Ex4.3");
+        _subscribe(alice, 1_000e6);
+        compliance.setWhitelisted(alice, false);
+
+        // Removing the sender from the whitelist freezes ordinary transfers.
+        vm.startPrank(alice);
+        vm.expectRevert(abi.encodeWithSelector(TBillToken.NotWhitelisted.selector, alice));
+        tBill.transfer(bob, 1e18);
+        vm.stopPrank();
+
+        // burn() also routes through _update(), so the same compliance guard
+        // unintentionally prevents an authorised issuer from confiscating shares.
+        vm.expectRevert(abi.encodeWithSelector(TBillToken.NotWhitelisted.selector, alice));
+        tBill.burn(alice, 1_000e18);
+
+        assertEq(tBill.balanceOf(alice), 1_000e18);
     }
 }

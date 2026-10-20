@@ -132,6 +132,82 @@ The bridge has four planks. Each one is a contract or a role in this repo.
 | `src/exercises/MockPriceFeed.sol` | **The NAV oracle.** 8 decimals; `1.00e8` is par | (b) attestation |
 | `src/exercises/RedemptionQueue.sol` | **T+1.** Shares in, a queue ticket out, cash later — **your TODOs, Ex5** | (c) redemption |
 
+
+### Architecture — the four-plank bridge
+
+
+
+```mermaid
+flowchart LR
+    Investor["Investor<br/>KYC-approved holder"]
+    Reporter["Fund administrator<br/>NAV reporter"]
+    Operator["Fund operator"]
+
+    subgraph OnChain["ON-CHAIN CONTRACTS"]
+        Registry["ComplianceRegistry<br/>Plank (d): admission"]
+        Token["TBillToken<br/>18-decimal fund shares"]
+        Feed["MockPriceFeed<br/>8-decimal NAV"]
+        Vault["TBillVault<br/>subscriptions and reserves"]
+        Queue["RedemptionQueue<br/>Plank (c): T+1 redemption"]
+        MockCustody["MockTBillCustodian<br/>reported holdings"]
+    end
+
+    subgraph OffChain["OFF-CHAIN REAL WORLD"]
+        Custody["SPV and real-world custodian<br/>Plank (a): legal custody"]
+        Bills["Short-dated US T-Bills"]
+    end
+
+    %% Admission and compliance
+    Registry -. "checks sender and receiver on mint, transfer and burn" .-> Token
+    Queue -. "queue address must be whitelisted in" .-> Registry
+
+    %% Subscription flow
+    Investor -- "USDC: subscribe()" --> Vault
+    Vault -- "mint()" --> Token
+    Token -- "tBILL shares" --> Investor
+
+    %% NAV attestation flow
+    Reporter -- "attest(nav)" --> Vault
+    Vault -- "setPrice(nav)" --> Feed
+    Feed -- "latestRoundData(): NAV" --> Vault
+
+    %% Investment and custody flow
+    Operator -- "invest()" --> Vault
+    Vault -- "USDC and recordPurchase()" --> MockCustody
+    MockCustody -. "on-chain representation of reported holdings" .-> Custody
+    Custody -- "holds assets for the SPV" --> Bills
+
+    %% Off-chain sale and reserve return
+    Bills -- "sale proceeds after T+1" --> Custody
+    Custody -. "cash returned through the operator" .-> Operator
+    Operator -- "recordSale()" --> MockCustody
+    Operator -- "USDC: depositReserves()" --> Vault
+
+    %% Redemption flow
+    Investor -- "tBILL: approve and enqueue()" --> Queue
+    Queue -- "settle(): request reserve release" --> Vault
+    Vault -- "USDC: releaseReserves()" --> Queue
+    Queue -- "burn escrowed shares" --> Token
+    Queue -- "USDC: claim()" --> Investor
+```
+
+
+
+#### Design rationale
+
+1. **Custody — plank (a).** The SPV legally owns the T-Bills, and the custodian holds them on its behalf. `MockTBillCustodian` represents the reported off-chain position. The chain can read this report, but it cannot independently prove that the securities exist.
+
+2. **Attestation — plank (b).** The fund administrator reports NAV through `attest()`. Subscription prices, claim values, and redemption amounts depend on this value. This makes the reporter a critical trust assumption.
+
+3. **Redemption — plank (c).** A holder transfers tBILL shares into `RedemptionQueue`. The queue locks the redemption value and preserves FIFO order. After the SPV sells T-Bills and returns USDC, the queue burns the settled shares and credits cash to the holder.
+
+4. **Admission — plank (d).** `ComplianceRegistry` determines which addresses may hold tBILL. `TBillToken` checks both endpoints of every balance change. The queue must also be whitelisted because settlement burns its escrowed shares.
+
+#### Where cash and shares cross the bridge
+
+During subscription, USDC moves from the investor to `TBillVault` and may then leave the chain economically when the SPV purchases T-Bills. In return, tBILL shares are minted to the investor on-chain. During redemption, shares move from the investor into `RedemptionQueue` and are later burned. Cash moves in the opposite direction: the custodian sells T-Bills, the proceeds return to the vault, and USDC flows through the queue to the investor.
+
+
 ### The two invariants you will defend (Ex6)
 
 ```
@@ -150,6 +226,23 @@ whitelisted (burning its escrowed shares is a balance change); the vault must be
 queue is; the custodian must recognize the vault. Skip any one and the loop reverts.
 
 ---
+
+## Deployment (Sepolia)
+
+The complete RWA bridge was deployed to Ethereum Sepolia, chain ID `11155111`.
+All seven contracts were deployed successfully and their source code was verified on Etherscan.
+
+Deployer: `0xD554C1025451Da2cF86f0b26722390B098c986A1`
+
+| Contract | Address | Verified source |
+|---|---|---|
+| MockUSDC | `0x950d49a663Ab6635D166b5Ec565685ec49F9f63A` | [Etherscan](https://sepolia.etherscan.io/address/0x950d49a663ab6635d166b5ec565685ec49f9f63a#code) |
+| ComplianceRegistry | `0xc52A8E6bF7b515768b8FDc3A87a0419A47877A30` | [Etherscan](https://sepolia.etherscan.io/address/0xc52a8e6bf7b515768b8fdc3a87a0419a47877a30#code) |
+| MockPriceFeed | `0x127E96123e447Fb388c165d55634Ea4877b62255` | [Etherscan](https://sepolia.etherscan.io/address/0x127e96123e447fb388c165d55634ea4877b62255#code) |
+| TBillToken | `0x32AF4DFf86113d0eB78e0b199251E961A1Fb2f6f` | [Etherscan](https://sepolia.etherscan.io/address/0x32af4dff86113d0eb78e0b199251e961a1fb2f6f#code) |
+| MockTBillCustodian | `0x6b9f2aaB6098803C572eE461b2A6048116c17494` | [Etherscan](https://sepolia.etherscan.io/address/0x6b9f2aab6098803c572ee461b2a6048116c17494#code) |
+| TBillVault | `0xDE784E77F1f2E4aDB0F1bC087aBdbE4180eBecb2` | [Etherscan](https://sepolia.etherscan.io/address/0xde784e77f1f2e4adb0f1bc087abdbe4180ebecb2#code) |
+| RedemptionQueue | `0xb7a0D2f922b8Bf894Bc211C7ff178244ECB6963B` | [Etherscan](https://sepolia.etherscan.io/address/0xb7a0d2f922b8bf894bc211c7ff178244ecb6963b#code) |
 
 ## 4. Homework
 
